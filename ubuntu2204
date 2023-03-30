@@ -1,0 +1,247 @@
+---
+- name: Plantilla para Ubuntu 22.04
+  # hosts: servers
+  hosts: test
+  become: yes
+  vars:
+    hostname: "srv-batman"
+    syslog_server: "10.5.2.10:514"
+    vmware_vm: "yes"
+    local_user_name: "user"
+    local_user_pass: "passwd"
+
+
+
+  tasks:
+
+
+  - name: Fijando hostname
+    hostname:
+      name: "{{ hostname }}"
+
+  - name: Actualizar lista de paquetes <apt update>
+    apt:
+      update_cache: yes
+
+  - name: Actualizar paquetes <apt -y upgrade>
+    apt:
+      upgrade: dist
+      force_apt_get: yes
+      autoremove: yes
+
+  - name: Instalando paquetes utiles como vim, tcpdump...
+    apt:
+      name: vim, nmap, tcpdump, iftop, nano
+      state: present
+
+  - name: instalar NTP
+    apt:
+      name: ntp, ntpdate
+      state: present
+
+  - name: Parando ntp...
+    systemd:
+      name: ntp
+      state: stopped
+
+  - name: Sincronización inicial
+    shell: ntpdate 10.5.2.11
+
+  - name: Subiendo ntp.conf
+    template: src=./templates/ntp.conf dest=/etc/ntp.conf
+
+  - name: Arrancando ntp...
+    systemd:
+      name: ntp
+      enabled: true
+      state: started
+
+  - name: Agregar configuración de rsyslog para mensajes de autenticación
+    blockinfile:
+      path: /etc/rsyslog.d/50-default.conf
+      block: |
+        auth,authpriv.*    @{{ syslog_server }}
+      insertafter: '# Rules for authentication and authorization audit'
+    notify:
+      - Reiniciar rsyslog
+
+  - name: Modificar PS1 de root
+    template:
+      src: ./templates/root_bashrc
+      dest: /root/.bashrc
+      mode: 0644
+      owner: root
+      group: root
+
+  - name: unattended_upgrades
+    apt:
+      name: unattended-upgrades
+      state: absent
+
+  - name: Retener actualización de paquetes 'complicados'
+    shell: |
+      apt-mark hold unattended-upgrades
+      apt-mark hold linux-image-generic
+      apt-mark hold linux-headers-generic
+
+  - name: Instalar Firehol
+    apt:
+      name: firehol
+      state: present
+
+  - name: Configurar Firehol
+    lineinfile:
+      path: /etc/default/firehol
+      regexp: '^START_FIREHOL'
+      line: 'START_FIREHOL=YES'
+      state: present
+
+  - name: Cargando plantilla de reglas
+    template:
+      src: ./templates/firehol.conf
+      dest: /etc/firehol/firehol.conf
+      mode: 0644
+      owner: root
+      group: root
+    notify:
+    - Reiniciar firehol
+
+  - name: MOTD
+    shell:
+      rm -f /etc/update-motd.d/*  && \
+      touch /etc/update-motd.d/00-header && \
+      chmod +x /etc/update-motd.d/00-header && \
+      echo "#!/bin/sh" >> /etc/update-motd.d/00-header && \
+      echo "echo \" ******************************************\"" >> /etc/update-motd.d/00-header && \
+      echo "echo \" * You logged a system property of SCAYLE *\"" >> /etc/update-motd.d/00-header && \
+      echo "echo \" * Logging user activity.                 *\"" >> /etc/update-motd.d/00-header && \
+      echo "echo \" ******************************************\"" >> /etc/update-motd.d/00-header && \
+      echo "echo \"\"" >> /etc/update-motd.d/00-header
+    args:
+      warn: false
+
+  - name: Instalando snmpd
+    apt:
+      name: snmpd
+      state: present
+
+  - name: Activar servicio snmpd
+    systemd:
+      name: snmpd
+      enabled: yes
+
+
+  - name: Configuracion snmpd.conf
+    template:
+      src: "./templates/snmpd.conf"
+      dest: "/etc/snmp/snmpd.conf"
+      mode: 600
+      owner: root
+      group: root
+    notify:
+    - Reiniciar snmpd
+
+  - name: Crear directorio SCRIPTS en root
+    file:
+      path: /root/SCRIPTS
+      state: directory
+
+
+  - name: Scripts en _root_SCRIPTS_
+    template:
+      src: "{{ item.src }}"
+      dest: "{{ item.dest }}"
+      mode: 0750
+      owner: root
+      group: root
+    with_items:
+      - { src: "./templates/install_security_updates.sh", dest: "/root/SCRIPTS/install_security_udpates.sh" }
+      - { src: "./templates/show_security_updates.sh", dest: "/root/SCRIPTS/show_security_udpates.sh" }
+
+  - name: Scripts en usr local bin
+    file:
+      path: /usr/local/bin/check_updates
+      state: directory
+
+  - name: scripts en usr local bin check_updates
+    template:
+      src: "{{ item.src }}"
+      dest: "{{ item.dest }}"
+      mode: 0755
+      owner: root
+      group: root
+    with_items:
+      - { src: "./templates/check_updates/check_pending_updates.sh", dest: "/usr/local/bin/check_updates/check_pending_updates.sh" }
+      - { src: "./templates/check_updates/update_pending_updates.sh", dest: "/usr/local/bin/check_updates/update_pending_updates.sh" }
+
+  - name: fail2ban
+    block:
+      #- name: Instalar
+      - apt:
+          name: fail2ban
+          state: present
+          #      - name: fail2ban ignoreip locale
+      - lineinfile:
+          path: /etc/fail2ban/jail.conf
+          regexp: '^#ignoreip'
+          line: 'ignoreip = 127.0.0.1/8 10.0.0.0/8'
+          state: present
+          #- name: Activar servicio fail2ban
+      - systemd:
+          name: fail2ban
+          enabled: yes
+          #      - name: Reiniciar fail2ban
+      - systemd:
+          name: fail2ban
+          state: restarted
+
+  - name: VMWare Tools open-vm-tools
+    apt:
+      name: open-vm-tools
+      state: present
+    when: vmware_vm == 'yes'
+
+  - name: Enable open-vm-tools service
+    systemd:
+      name: open-vm-tools
+      enabled: yes
+
+  - name: Restart open-vm-tools service
+    systemd:
+      name: open-vm-tools
+      state: restarted
+
+  - name: Usuario sudo
+    user:
+      name:  "{{ local_user_name }}"
+      state: present
+      create_home: true
+      shell: /bin/bash
+
+  - name: Password del usuario
+    user:
+      name: "{{ local_user_name }}"
+      password: "{{ local_user_pass | password_hash('sha512') }}"
+      state: present
+
+
+  handlers:
+    - name: Reiniciar fail2ban
+      systemd:
+        name: fail2ban
+        state: restarted
+
+    - name: Reiniciar rsyslog
+      service:
+        name: rsyslog
+        state: restarted
+
+    - name: Reiniciar firehol
+      service:
+        name: firehol
+        state: restarted
+
+    - name: Reiniciar snmpd
+      service:
+        name: snmpd
+        state: restarted
